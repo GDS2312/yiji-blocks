@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useRef, useState, useEffect, useCallback } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Placeholder from '@tiptap/extension-placeholder';
@@ -9,142 +9,141 @@ import Link from '@tiptap/extension-link';
 import Image from '@tiptap/extension-image';
 import Underline from '@tiptap/extension-underline';
 import type { Note, AppSettings } from '../types';
-import { Mic, ImageIcon, Sparkles, Loader2, Download, Bold, Italic, Strikethrough, Code, List, ListOrdered, CheckSquare, Quote, Undo, Redo } from 'lucide-react';
-import { analyzeImage as aiAnalyze } from '../ai-engine';
+import {
+  Bold, Italic, Underline as UnderlineIcon, Strikethrough, Code,
+  List, ListOrdered, CheckSquare, Quote, Minus, Undo, Redo,
+  Heading1, Heading2, Heading3,
+  Mic, MicOff, ImageIcon, Download, Star, Tag, X, Loader2
+} from 'lucide-react';
 
-interface EditorProps {
+interface Props {
   note: Note | null;
   onUpdate: (updates: Partial<Note>) => void;
-  onExtractTasks: (noteId: string) => void;
+  onToggleStar: (id: string) => void;
   settings: AppSettings;
 }
 
-export function Editor({ note, onUpdate, onExtractTasks, settings }: EditorProps) {
-  const [extracting, setExtracting] = useState(false);
+const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+export function Editor({ note, onUpdate, onToggleStar, settings }: Props) {
+  const [voiceActive, setVoiceActive] = useState(false);
+  const [voiceInterim, setVoiceInterim] = useState('');
   const [uploading, setUploading] = useState(false);
-  const [recording, setRecording] = useState(false);
-  const [recTime, setRecTime] = useState(0);
-  const [voiceResult, setVoiceResult] = useState<string | null>(null);
+  const [tagInput, setTagInput] = useState('');
+  const [showTagInput, setShowTagInput] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
-  const recRef = useRef<MediaRecorder | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recogRef = useRef<any>(null);
+  const noteIdRef = useRef<string | null>(null);
 
   const editor = useEditor({
     extensions: [
-      StarterKit.configure({ heading: { levels: [1, 2, 3] } }),
-      Placeholder.configure({ placeholder: '输入 / 选择块类型，或直接开始写作...' }),
-      TaskList, TaskItem.configure({ nested: true }),
-      Highlight, Link.configure({ openOnClick: false }),
+      StarterKit.configure({ heading: { levels: [1, 2, 3] }, codeBlock: false }),
+      Placeholder.configure({ placeholder: '开始写作，或输入 / 选择块类型...' }),
+      TaskList,
+      TaskItem.configure({ nested: true }),
+      Highlight,
+      Link.configure({ openOnClick: false }),
       Image.configure({ allowBase64: true }),
       Underline,
     ],
-    content: note?.content || '',
+    content: '',
     onUpdate: ({ editor }) => {
-      const html = editor.getHTML();
-      if (note && html !== note.content) onUpdate({ content: html });
+      if (noteIdRef.current) {
+        onUpdate({ content: editor.getHTML() });
+      }
     },
     editorProps: {
-      attributes: {
-        class: 'prose prose-slate max-w-none focus:outline-none min-h-[400px] px-8 py-6 text-[15px] leading-relaxed',
-      },
+      attributes: { class: 'yiji-editor focus:outline-none' },
     },
   });
 
-  // Sync content when note changes
-  if (editor && note && editor.getHTML() !== note.content && !editor.isFocused) {
-    editor.commands.setContent(note.content || '');
-  }
-
-  const handleExtract = async () => {
-    if (!note || !editor) return;
-    setExtracting(true);
-    const text = editor.getText();
-    if (text.trim()) {
-      await new Promise(r => setTimeout(r, 200));
-      onExtractTasks(note.id);
+  // Sync note content when switching notes
+  useEffect(() => {
+    if (!editor) return;
+    if (note?.id !== noteIdRef.current) {
+      noteIdRef.current = note?.id ?? null;
+      editor.commands.setContent(note?.content || '');
     }
-    setExtracting(false);
+  }, [editor, note?.id, note?.content]);
+
+  // Paste image from clipboard
+  useEffect(() => {
+    if (!editor) return;
+    const onPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (!file) continue;
+          const reader = new FileReader();
+          reader.onload = ev => {
+            editor.chain().focus().setImage({ src: ev.target?.result as string }).run();
+          };
+          reader.readAsDataURL(file);
+          e.preventDefault();
+        }
+      }
+    };
+    document.addEventListener('paste', onPaste);
+    return () => document.removeEventListener('paste', onPaste);
+  }, [editor]);
+
+  // Voice input via Web Speech API
+  const startVoice = useCallback(() => {
+    if (!SpeechRecognition) {
+      alert('您的浏览器不支持语音识别，请使用 Chrome 或 Edge');
+      return;
+    }
+    const recog = new SpeechRecognition();
+    recog.lang = settings.speechLang || 'zh-CN';
+    recog.interimResults = true;
+    recog.maxAlternatives = 1;
+    recog.continuous = false;
+
+    recog.onresult = (event: any) => {
+      let interim = '';
+      let final = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) final += event.results[i][0].transcript;
+        else interim += event.results[i][0].transcript;
+      }
+      setVoiceInterim(interim);
+      if (final) {
+        editor?.chain().focus().insertContent(`<p>${final}</p>`).run();
+        setVoiceInterim('');
+      }
+    };
+    recog.onerror = () => { setVoiceActive(false); setVoiceInterim(''); };
+    recog.onend = () => { setVoiceActive(false); setVoiceInterim(''); };
+
+    recogRef.current = recog;
+    recog.start();
+    setVoiceActive(true);
+  }, [editor, settings.speechLang]);
+
+  const stopVoice = () => {
+    recogRef.current?.stop();
+    setVoiceActive(false);
+    setVoiceInterim('');
   };
 
-  const handleImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImage = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !editor) return;
     setUploading(true);
     const reader = new FileReader();
-    reader.onload = async (ev) => {
-      const dataUrl = ev.target?.result as string;
-      editor.chain().focus().setImage({ src: dataUrl }).run();
-      if (settings.aiMode === 'llm' && settings.llmEndpoint) {
-        const text = await aiAnalyze(dataUrl, settings);
-        if (text) {
-          onUpdate({ content: editor.getHTML() });
-          setVoiceResult('📷 识别结果：' + text);
-        }
-      }
+    reader.onload = ev => {
+      editor.chain().focus().setImage({ src: ev.target?.result as string }).run();
       setUploading(false);
     };
     reader.readAsDataURL(file);
-  };
-
-  const startRec = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const rec = new MediaRecorder(stream, {
-        mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm',
-      });
-      const chunks: Blob[] = [];
-      rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-      rec.onstop = async () => {
-        stream.getTracks().forEach(t => t.stop());
-        if (timerRef.current) clearInterval(timerRef.current);
-        const blob = new Blob(chunks, { type: 'audio/webm' });
-        if (settings.aiMode === 'llm' && settings.llmEndpoint) {
-          try {
-            const reader = new FileReader();
-            const b64 = await new Promise<string>(r => { reader.onloadend = () => r(reader.result as string); });
-            reader.readAsDataURL(blob);
-            const base64 = await b64;
-            const resp = await fetch(settings.llmEndpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + settings.llmApiKey },
-              body: JSON.stringify({ model: settings.llmModel, messages: [{ role: 'user', content: [
-                { type: 'text', text: '转写音频为文字，只输出结果。' },
-                { type: 'input_audio', input_audio: { data: base64.split(',')[1], format: 'webm' } },
-              ]}]}),
-            });
-            const data = await resp.json();
-            const text = data.choices?.[0]?.message?.content || '';
-            if (text) {
-              setVoiceResult(text);
-              return;
-            }
-          } catch {}
-        }
-        setVoiceResult('__MANUAL__');
-      };
-      rec.start();
-      recRef.current = rec;
-      setRecording(true);
-      setRecTime(0);
-      timerRef.current = setInterval(() => setRecTime(t => t + 1), 1000);
-    } catch { alert('无法访问麦克风'); }
-  };
-
-  const stopRec = () => {
-    if (recRef.current?.state === 'recording') recRef.current.stop();
-    setRecording(false);
-  };
-
-  const confirmVoice = (text: string) => {
-    if (editor) {
-      editor.commands.insertContent(`<p>${text}</p>`);
-    }
-    setVoiceResult(null);
+    e.target.value = '';
   };
 
   const handleExport = () => {
-    if (!note) return;
-    const md = `# ${note.title || '无标题'}\n\n${editor?.getText() || ''}`;
+    if (!note || !editor) return;
+    const md = `# ${note.title || '无标题'}\n\n${editor.getText()}`;
     const blob = new Blob([md], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -152,104 +151,179 @@ export function Editor({ note, onUpdate, onExtractTasks, settings }: EditorProps
     URL.revokeObjectURL(url);
   };
 
-  const fmtTime = (s: number) => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+  const addTag = () => {
+    const tag = tagInput.trim();
+    if (!tag || !note) return;
+    const tags = Array.from(new Set([...(note.tags || []), tag]));
+    onUpdate({ tags });
+    setTagInput('');
+    setShowTagInput(false);
+  };
+
+  const removeTag = (tag: string) => {
+    if (!note) return;
+    onUpdate({ tags: note.tags.filter(t => t !== tag) });
+  };
+
+  const wordCount = editor?.getText().replace(/\s/g, '').length || 0;
 
   if (!note) {
-    return <div className="flex-1 flex items-center justify-center bg-white text-slate-400">选择笔记开始编辑</div>;
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center bg-white text-slate-400 select-none">
+        <div className="text-5xl mb-4">📝</div>
+        <p className="text-sm">选择一篇笔记开始编辑</p>
+        <p className="text-xs mt-1 text-slate-300">或在左侧创建新笔记</p>
+      </div>
+    );
   }
 
+  const ToolBtn = ({ onClick, active, title, children }: { onClick: () => void; active?: boolean; title?: string; children: React.ReactNode }) => (
+    <button
+      onClick={onClick}
+      title={title}
+      className={`p-1.5 rounded transition-colors ${active ? 'bg-violet-100 text-violet-700' : 'text-slate-500 hover:bg-slate-100'}`}
+    >{children}</button>
+  );
+
   return (
-    <div className="flex-1 flex flex-col overflow-hidden bg-white">
-      {/* Toolbar */}
-      <div className="flex items-center gap-0.5 px-4 py-1.5 border-b border-slate-100 flex-wrap bg-white sticky top-0 z-10">
-        <div className="flex items-center gap-0.5">
-          {[
-            { icon: Bold, action: () => editor?.chain().focus().toggleBold().run(), active: editor?.isActive('bold') },
-            { icon: Italic, action: () => editor?.chain().focus().toggleItalic().run(), active: editor?.isActive('italic') },
-            { icon: Strikethrough, action: () => editor?.chain().focus().toggleStrike().run(), active: editor?.isActive('strike') },
-            { icon: Code, action: () => editor?.chain().focus().toggleCode().run(), active: editor?.isActive('code') },
-          ].map(({ icon: Icon, action, active }, i) => (
-            <button key={i} onClick={action}
-              className={`p-1.5 rounded transition-colors ${active ? 'bg-purple-100 text-purple-700' : 'text-slate-500 hover:bg-slate-100'}`}>
-              <Icon size={15} />
-            </button>
-          ))}
+    <div className="flex-1 flex flex-col h-full overflow-hidden bg-white">
+      {/* Title bar */}
+      <div className="px-8 pt-6 pb-2 flex-shrink-0 border-b border-slate-100">
+        <div className="flex items-start gap-2">
+          <input
+            value={note.title}
+            onChange={e => onUpdate({ title: e.target.value })}
+            placeholder="无标题"
+            className="flex-1 text-2xl font-bold text-slate-800 outline-none placeholder-slate-300 bg-transparent"
+          />
+          <button
+            onClick={() => onToggleStar(note.id)}
+            className={`p-1.5 rounded-lg transition-colors flex-shrink-0 ${note.starred ? 'text-amber-400 bg-amber-50' : 'text-slate-300 hover:text-amber-400'}`}
+          ><Star size={18} fill={note.starred ? 'currentColor' : 'none'} /></button>
         </div>
-        <div className="w-px h-5 mx-1 bg-slate-200" />
-        <div className="flex items-center gap-0.5">
-          {[
-            { icon: List, action: () => editor?.chain().focus().toggleBulletList().run(), active: editor?.isActive('bulletList') },
-            { icon: ListOrdered, action: () => editor?.chain().focus().toggleOrderedList().run(), active: editor?.isActive('orderedList') },
-            { icon: CheckSquare, action: () => editor?.chain().focus().toggleTaskList().run(), active: editor?.isActive('taskList') },
-            { icon: Quote, action: () => editor?.chain().focus().toggleBlockquote().run(), active: editor?.isActive('blockquote') },
-          ].map(({ icon: Icon, action, active }, i) => (
-            <button key={i} onClick={action}
-              className={`p-1.5 rounded transition-colors ${active ? 'bg-purple-100 text-purple-700' : 'text-slate-500 hover:bg-slate-100'}`}>
-              <Icon size={15} />
-            </button>
+        <p className="text-xs text-slate-400 mt-1">
+          {new Date(note.updatedAt).toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+          {wordCount > 0 && ` · ${wordCount} 字`}
+        </p>
+        {/* Tags */}
+        <div className="flex flex-wrap items-center gap-1.5 mt-2">
+          {(note.tags || []).map(tag => (
+            <span key={tag} className="flex items-center gap-1 text-[11px] px-2 py-0.5 bg-violet-50 text-violet-600 rounded-full">
+              {tag}
+              <button onClick={() => removeTag(tag)} className="hover:text-red-400"><X size={10} /></button>
+            </span>
           ))}
+          {showTagInput ? (
+            <input
+              autoFocus
+              value={tagInput}
+              onChange={e => setTagInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') addTag(); if (e.key === 'Escape') setShowTagInput(false); }}
+              onBlur={addTag}
+              placeholder="添加标签"
+              className="text-[11px] px-2 py-0.5 border border-violet-300 rounded-full outline-none w-20"
+            />
+          ) : (
+            <button
+              onClick={() => setShowTagInput(true)}
+              className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-violet-500 px-1.5 py-0.5 rounded-full hover:bg-violet-50 transition-colors"
+            ><Tag size={11} /> 标签</button>
+          )}
         </div>
-        <div className="w-px h-5 mx-1 bg-slate-200" />
-        <button onClick={() => editor?.chain().focus().undo().run()} className="p-1.5 rounded text-slate-500 hover:bg-slate-100"><Undo size={15} /></button>
-        <button onClick={() => editor?.chain().focus().redo().run()} className="p-1.5 rounded text-slate-500 hover:bg-slate-100"><Redo size={15} /></button>
+      </div>
+
+      {/* Formatting toolbar */}
+      <div className="flex items-center gap-0.5 px-4 py-1.5 border-b border-slate-100 flex-wrap flex-shrink-0 bg-slate-50/60">
+        <ToolBtn onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()} active={editor?.isActive('heading', { level: 1 })} title="标题 1">
+          <Heading1 size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()} active={editor?.isActive('heading', { level: 2 })} title="标题 2">
+          <Heading2 size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()} active={editor?.isActive('heading', { level: 3 })} title="标题 3">
+          <Heading3 size={15} />
+        </ToolBtn>
+        <div className="w-px h-4 bg-slate-200 mx-0.5" />
+        <ToolBtn onClick={() => editor?.chain().focus().toggleBold().run()} active={editor?.isActive('bold')} title="粗体 Ctrl+B">
+          <Bold size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleItalic().run()} active={editor?.isActive('italic')} title="斜体 Ctrl+I">
+          <Italic size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleUnderline().run()} active={editor?.isActive('underline')} title="下划线 Ctrl+U">
+          <UnderlineIcon size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleStrike().run()} active={editor?.isActive('strike')} title="删除线">
+          <Strikethrough size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleHighlight().run()} active={editor?.isActive('highlight')} title="高亮">
+          <span className="text-[13px] font-bold bg-yellow-200 px-0.5 rounded">A</span>
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleCode().run()} active={editor?.isActive('code')} title="行内代码">
+          <Code size={15} />
+        </ToolBtn>
+        <div className="w-px h-4 bg-slate-200 mx-0.5" />
+        <ToolBtn onClick={() => editor?.chain().focus().toggleBulletList().run()} active={editor?.isActive('bulletList')} title="无序列表">
+          <List size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleOrderedList().run()} active={editor?.isActive('orderedList')} title="有序列表">
+          <ListOrdered size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleTaskList().run()} active={editor?.isActive('taskList')} title="任务清单">
+          <CheckSquare size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().toggleBlockquote().run()} active={editor?.isActive('blockquote')} title="引用">
+          <Quote size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().setHorizontalRule().run()} title="分割线">
+          <Minus size={15} />
+        </ToolBtn>
+        <div className="w-px h-4 bg-slate-200 mx-0.5" />
+        <ToolBtn onClick={() => editor?.chain().focus().undo().run()} title="撤销 Ctrl+Z">
+          <Undo size={15} />
+        </ToolBtn>
+        <ToolBtn onClick={() => editor?.chain().focus().redo().run()} title="重做 Ctrl+Y">
+          <Redo size={15} />
+        </ToolBtn>
         <div className="flex-1" />
-        <button onClick={handleExport} className="p-1.5 rounded text-slate-400 hover:text-slate-600" title="导出 Markdown"><Download size={15} /></button>
-        <button onClick={handleExtract} disabled={extracting}
-          className="flex items-center gap-1 px-3 py-1 rounded-md text-xs font-medium bg-purple-50 text-purple-700 border border-purple-200 hover:bg-purple-100 disabled:opacity-50">
-          {extracting ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
-          AI 提取任务
+        <button onClick={handleExport} title="导出 Markdown" className="p-1.5 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors">
+          <Download size={15} />
         </button>
       </div>
 
-      {/* Voice result toast */}
-      {voiceResult && (
-        <div className="mx-4 mt-2 p-3 rounded-lg border border-green-200 bg-green-50 animate-slideUp">
-          {voiceResult === '__MANUAL__' ? (
-            <div>
-              <p className="text-sm font-medium mb-2">录音完成，请输入内容：</p>
-              <textarea id="voiceInput" rows={2} className="w-full text-sm border rounded p-2 mb-2 resize-none" placeholder="输入录音内容..." />
-              <div className="flex gap-2">
-                <button onClick={() => { const v = (document.getElementById('voiceInput') as HTMLTextAreaElement)?.value?.trim(); if (v) confirmVoice(v); }}
-                  className="px-3 py-1 rounded text-xs font-medium bg-purple-600 text-white">插入</button>
-                <button onClick={() => setVoiceResult(null)} className="px-3 py-1 rounded text-xs text-slate-500 border">取消</button>
-              </div>
-            </div>
-          ) : (
-            <div>
-              <p className="text-sm mb-2 p-2 bg-white rounded border">{voiceResult}</p>
-              <div className="flex gap-2">
-                <button onClick={() => confirmVoice(voiceResult)} className="px-3 py-1 rounded text-xs font-medium bg-purple-600 text-white">插入笔记</button>
-                <button onClick={() => setVoiceResult(null)} className="px-3 py-1 rounded text-xs text-slate-500 border">取消</button>
-              </div>
-            </div>
-          )}
+      {/* Voice interim overlay */}
+      {voiceInterim && (
+        <div className="mx-8 mt-2 px-3 py-2 bg-green-50 border border-green-200 rounded-lg text-sm text-green-700 animate-pulse flex-shrink-0">
+          🎙️ {voiceInterim}...
         </div>
       )}
 
-      {/* Editor */}
-      <div className="flex-1 overflow-auto">
-        <EditorContent editor={editor} />
+      {/* Editor body */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto px-8 py-4">
+          <EditorContent editor={editor} />
+        </div>
       </div>
 
-      {/* Bottom bar */}
-      <div className="flex items-center gap-2 px-4 py-2 border-t border-slate-100 bg-slate-50/50">
-        <button onClick={recording ? stopRec : startRec}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
-            recording ? 'bg-red-500 text-white' : 'text-slate-500 border border-slate-200 hover:bg-slate-100'
-          }`}>
-          <Mic size={13} />
-          {recording ? `停止 ${fmtTime(recTime)}` : '语音录入'}
+      {/* Bottom multimodal bar */}
+      <div className="flex items-center gap-2 px-6 py-2.5 border-t border-slate-100 bg-slate-50/60 flex-shrink-0">
+        <button
+          onClick={voiceActive ? stopVoice : startVoice}
+          className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all
+            ${voiceActive ? 'bg-red-500 text-white shadow-md shadow-red-200 animate-pulse' : 'text-slate-600 border border-slate-200 hover:bg-slate-100 hover:border-slate-300'}`}
+        >
+          {voiceActive ? <><MicOff size={13} /> 停止朗读</> : <><Mic size={13} /> 语音输入</>}
         </button>
-        <button onClick={() => fileRef.current?.click()} disabled={uploading}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-slate-500 border border-slate-200 hover:bg-slate-100">
-          <ImageIcon size={13} />
-          {uploading ? '识别中' : '插入图片'}
+        <button
+          onClick={() => fileRef.current?.click()}
+          disabled={uploading}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-600 border border-slate-200 hover:bg-slate-100 hover:border-slate-300 transition-colors"
+        >
+          {uploading ? <Loader2 size={13} className="animate-spin" /> : <ImageIcon size={13} />}
+          插入图片
         </button>
         <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleImage} />
-        <div className="flex-1" />
-        <span className="text-[11px] text-slate-400">
-          {editor?.getText().replace(/\s/g, '').length || 0} 字 · 块编辑器
-        </span>
+        <span className="text-[11px] text-slate-400 ml-auto">Ctrl+V 粘贴图片</span>
       </div>
     </div>
   );

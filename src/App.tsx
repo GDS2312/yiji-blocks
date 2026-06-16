@@ -1,208 +1,246 @@
 import { useState, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db, genId, getSettings, saveSettings } from './db';
-import type { Notebook, Note, TaskItem, AppSettings } from './types';
+import type { Notebook, Note, AppSettings } from './types';
+import { Sidebar } from './components/Sidebar';
+import { NoteList } from './components/NoteList';
 import { Editor } from './components/Editor';
-import { extractTasks } from './ai-engine';
-import { Menu, Plus, Search, Settings, Moon, Sun, FileText, Trash2, Circle, CheckCircle2, X } from 'lucide-react';
+import { Menu, X, ChevronLeft, Moon, Sun, Plus } from 'lucide-react';
 
-function App() {
-  const [activeNb, setActiveNb] = useState<string | null>(null);
-  const [activeNote, setActiveNote] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [taskOpen, setTaskOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+type MobileView = 'sidebar' | 'list' | 'editor';
+
+const NOTEBOOK_ICONS = ['📓','📔','📒','📕','📗','📘','📙','🗒️','📑','📋'];
+
+export default function App() {
+  const [filterType, setFilterType] = useState('all');
+  const [filterValue, setFilterValue] = useState('');
+  const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [search, setSearch] = useState('');
-  const [dark, setDark] = useState(false);
-  const [settings, setSettings] = useState<AppSettings>({ aiMode: 'rule', llmEndpoint: '', llmApiKey: '', llmModel: 'gpt-4o-mini' });
+  const [mobileView, setMobileView] = useState<MobileView>('list');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<AppSettings>({ theme: 'light', speechLang: 'zh-CN' });
 
   useEffect(() => { getSettings().then(setSettings); }, []);
-  useEffect(() => { document.documentElement.classList.toggle('dark', dark); }, [dark]);
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', settings.theme === 'dark');
+  }, [settings.theme]);
 
-  const notebooks = useLiveQuery(() => db.notebooks.orderBy('updatedAt').reverse().toArray()) as Notebook[] ?? [];
-  const notes = useLiveQuery(() => activeNb ? db.notes.where('notebookId').equals(activeNb).toArray() : Promise.resolve([] as Note[]), [activeNb]) as Note[] ?? [];
-  const activeNoteData = useLiveQuery(() => activeNote ? db.notes.get(activeNote) : undefined, [activeNote]) as Note | undefined;
-  const tasks = useLiveQuery(() => activeNb ? db.tasks.where('notebookId').equals(activeNb).toArray() : db.tasks.toArray(), [activeNb]) as TaskItem[] ?? [];
-  const pendingTasks = tasks.filter(t => t.status === 'pending');
-  const doneTasks = tasks.filter(t => t.status === 'done');
+  const notebooks = (useLiveQuery(() => db.notebooks.orderBy('updatedAt').reverse().toArray()) ?? []) as Notebook[];
+  const allNotes = (useLiveQuery(() => db.notes.orderBy('updatedAt').reverse().toArray()) ?? []) as Note[];
 
+  const filteredNotes: Note[] = (() => {
+    let base = allNotes;
+    if (filterType === 'starred') base = base.filter(n => n.starred);
+    else if (filterType === 'notebook') base = base.filter(n => n.notebookId === filterValue);
+    else if (filterType === 'tag') base = base.filter(n => n.tags?.includes(filterValue));
+    return base;
+  })();
+
+  const activeNote = allNotes.find(n => n.id === activeNoteId) ?? null;
+
+  // Bootstrap default notebook
   useEffect(() => {
     if (notebooks.length === 0) {
-      (async () => {
-        const id = genId(); const now = new Date().toISOString();
-        await db.notebooks.put({ id, name: '我的笔记本', icon: '📓', createdAt: now, updatedAt: now });
-        setActiveNb(id);
-      })();
+      const id = genId(); const now = new Date().toISOString();
+      db.notebooks.put({ id, name: '我的笔记本', icon: '📓', color: '#7c3aed', createdAt: now, updatedAt: now });
     }
   }, [notebooks.length]);
-  useEffect(() => { if (!activeNb && notebooks.length > 0) setActiveNb(notebooks[0].id); }, [activeNb, notebooks]);
 
-  const newNb = async () => {
-    const name = prompt('笔记本名称：'); if (!name?.trim()) return;
-    const id = genId(); const now = new Date().toISOString();
-    await db.notebooks.put({ id, name: name.trim(), icon: '📓', createdAt: now, updatedAt: now });
-    setActiveNb(id); setSidebarOpen(false);
+  const handleFilter = (type: string, value: string) => {
+    setFilterType(type); setFilterValue(value);
+    setActiveNoteId(null); setSidebarOpen(false);
   };
+
   const newNote = async () => {
-    if (!activeNb) return;
+    const nbId = filterType === 'notebook' ? filterValue : (notebooks[0]?.id ?? '');
+    if (!nbId) return;
     const id = genId(); const now = new Date().toISOString();
-    await db.notes.put({ id, notebookId: activeNb, title: '', content: '', createdAt: now, updatedAt: now });
-    await db.notebooks.update(activeNb, { updatedAt: now });
-    setActiveNote(id);
+    await db.notes.put({ id, notebookId: nbId, title: '', content: '', tags: [], starred: false, createdAt: now, updatedAt: now });
+    await db.notebooks.update(nbId, { updatedAt: now });
+    setActiveNoteId(id);
+    setMobileView('editor');
   };
-  const updateNote = async (updates: Partial<Note>) => {
-    if (!activeNote) return;
-    await db.notes.update(activeNote, { ...updates, updatedAt: new Date().toISOString() });
-    if (activeNb) await db.notebooks.update(activeNb, { updatedAt: new Date().toISOString() });
-  };
-  const delNote = async (id: string) => {
-    await db.notes.delete(id); await db.tasks.where('noteId').equals(id).delete();
-    if (activeNote === id) setActiveNote(null);
-  };
-  const extractFromNote = async (noteId: string) => {
-    const note = await db.notes.get(noteId);
-    if (!note) return;
-    const text = note.content.replace(/<[^>]*>/g, '\n').replace(/&nbsp;/g, ' ').trim();
-    if (!text) return;
-    const items = await extractTasks(text, settings);
-    const now = new Date().toISOString();
-    for (const item of items) {
-      await db.tasks.put({ id: genId(), noteId: noteId, notebookId: note.notebookId, title: item.title, priority: item.priority, status: 'pending', dueDate: item.dueDate, createdAt: now });
-    }
-    setTaskOpen(true);
-  };
-  const toggleTask = async (id: string) => { const t = await db.tasks.get(id); if (t) await db.tasks.update(id, { status: t.status === 'done' ? 'pending' : 'done' }); };
-  const delTask = async (id: string) => { await db.tasks.delete(id); };
 
-  const filtered = search ? notes.filter(n => n.title.toLowerCase().includes(search.toLowerCase())) : notes;
-  const currentNb = notebooks.find(n => n.id === activeNb);
+  const updateNote = async (updates: Partial<Note>) => {
+    if (!activeNoteId) return;
+    const now = new Date().toISOString();
+    await db.notes.update(activeNoteId, { ...updates, updatedAt: now });
+    const note = await db.notes.get(activeNoteId);
+    if (note) await db.notebooks.update(note.notebookId, { updatedAt: now });
+  };
+
+  const deleteNote = async (id: string) => {
+    await db.notes.delete(id);
+    if (activeNoteId === id) setActiveNoteId(null);
+  };
+
+  const toggleStar = async (id: string) => {
+    const n = await db.notes.get(id);
+    if (n) await db.notes.update(id, { starred: !n.starred });
+  };
+
+  const newNotebook = async () => {
+    const name = prompt('笔记本名称：');
+    if (!name?.trim()) return;
+    const icon = NOTEBOOK_ICONS[Math.floor(Math.random() * NOTEBOOK_ICONS.length)];
+    const id = genId(); const now = new Date().toISOString();
+    await db.notebooks.put({ id, name: name.trim(), icon, color: '#7c3aed', createdAt: now, updatedAt: now });
+    handleFilter('notebook', id);
+  };
+
+  const deleteNotebook = async (id: string) => {
+    if (!confirm('删除此笔记本？笔记将被移动到默认笔记本。')) return;
+    const defaultNb = notebooks.find(n => n.id !== id);
+    if (defaultNb) {
+      await db.notes.where('notebookId').equals(id).modify({ notebookId: defaultNb.id });
+    }
+    await db.notebooks.delete(id);
+    if (filterType === 'notebook' && filterValue === id) handleFilter('all', '');
+  };
+
+  const selectNote = (id: string) => {
+    setActiveNoteId(id);
+    setMobileView('editor');
+  };
 
   return (
-    <div className="flex flex-col h-screen bg-white">
-      {/* Top nav */}
-      <header className="flex items-center h-11 px-3 gap-2 flex-shrink-0 bg-purple-700 text-white select-none">
-        <button onClick={() => setSidebarOpen(true)} className="lg:hidden p-1 rounded hover:bg-white/15"><Menu size={16} /></button>
-        <span className="font-bold text-sm mr-3">⚡ 翼记</span>
-        <div className="flex items-center gap-0 overflow-x-auto flex-1" style={{ scrollbarWidth: 'none' }}>
-          {notebooks.map(nb => (
-            <button key={nb.id} onClick={() => setActiveNb(nb.id)}
-              className={`flex items-center gap-1 px-3 py-1 rounded-t text-xs font-medium whitespace-nowrap transition-colors ${activeNb === nb.id ? 'bg-white text-purple-700' : 'text-white/80 hover:bg-white/10'}`}>{nb.icon} {nb.name}</button>
-          ))}
-          <button onClick={newNb} className="p-1 rounded text-white/60 hover:bg-white/10"><Plus size={14} /></button>
-        </div>
-        <div className="relative hidden sm:block">
-          <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-white/50" />
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索..."
-            className="w-36 pl-7 pr-2 py-1 rounded text-xs bg-white/15 text-white placeholder-white/40 border border-white/20" />
-        </div>
-        <button onClick={() => setTaskOpen(!taskOpen)}
-          className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium ${taskOpen ? 'bg-white/20' : 'text-white/80 hover:bg-white/10'}`}>
-          📋 {pendingTasks.length > 0 && <span className="bg-red-400 text-white text-[10px] min-w-[16px] h-[16px] rounded-full flex items-center justify-center">{pendingTasks.length}</span>}
-        </button>
-        <button onClick={() => setDark(!dark)} className="p-1 rounded text-white/60 hover:bg-white/10">{dark ? <Sun size={14} /> : <Moon size={14} />}</button>
-        <button onClick={() => setSettingsOpen(true)} className="p-1 rounded text-white/60 hover:bg-white/10"><Settings size={14} /></button>
-      </header>
+    <div className={`flex h-screen overflow-hidden bg-white ${settings.theme === 'dark' ? 'dark' : ''}`}>
+      {/* Desktop: three-panel layout */}
+      <div className="hidden lg:flex flex-col w-60 flex-shrink-0 border-r border-slate-200 bg-slate-50">
+        <Sidebar
+          notebooks={notebooks} notes={allNotes}
+          filterType={filterType} filterValue={filterValue}
+          onFilter={handleFilter} onNewNotebook={newNotebook}
+          onDeleteNotebook={deleteNotebook} onOpenSettings={() => setSettingsOpen(true)}
+        />
+      </div>
 
-      <div className="flex flex-1 overflow-hidden">
-        {sidebarOpen && (
-          <div className="fixed inset-0 z-50 lg:hidden" onClick={() => setSidebarOpen(false)}>
-            <div className="absolute inset-0 bg-black/40" />
-            <div className="absolute left-0 top-0 bottom-0 w-72 bg-white shadow-2xl overflow-auto" onClick={e => e.stopPropagation()}>
-              <MobileSidebar notebooks={notebooks} notes={filtered} activeNb={activeNb} activeNote={activeNote}
-                tasks={pendingTasks} onSelectNb={(id: string) => { setActiveNb(id); setSidebarOpen(false); }}
-                onSelectNote={(id: string) => { setActiveNote(id); setSidebarOpen(false); }}
-                onNewNb={newNb} onNewNote={newNote} onDeleteNote={delNote}
-                onToggleTask={toggleTask} onDeleteTask={delTask} onClose={() => setSidebarOpen(false)} />
-            </div>
+      <div className="hidden lg:flex flex-col w-72 flex-shrink-0 border-r border-slate-200 bg-slate-50/50">
+        <NoteList
+          notes={filteredNotes} notebooks={notebooks}
+          activeNoteId={activeNoteId} search={search}
+          onSearch={setSearch} onSelect={selectNote}
+          onNew={newNote} onDelete={deleteNote}
+          onToggleStar={toggleStar}
+          filterType={filterType} filterValue={filterValue}
+        />
+      </div>
+
+      <div className="hidden lg:flex flex-1 overflow-hidden">
+        <Editor note={activeNote} onUpdate={updateNote} onToggleStar={toggleStar} settings={settings} />
+      </div>
+
+      {/* Mobile layout */}
+      <div className="flex lg:hidden flex-col w-full">
+        {/* Mobile top bar */}
+        <header className="flex items-center gap-2 px-3 h-12 border-b border-slate-200 bg-white flex-shrink-0">
+          {mobileView === 'editor' ? (
+            <button onClick={() => setMobileView('list')} className="p-1.5 text-slate-500"><ChevronLeft size={20} /></button>
+          ) : (
+            <button onClick={() => setSidebarOpen(true)} className="p-1.5 text-slate-500"><Menu size={18} /></button>
+          )}
+          <div className="flex items-center gap-1.5 flex-1">
+            <div className="w-6 h-6 rounded-md bg-violet-600 flex items-center justify-center text-white text-xs font-bold">翼</div>
+            <span className="font-semibold text-sm text-slate-800">
+              {mobileView === 'editor' ? (activeNote?.title || '无标题') : '翼记'}
+            </span>
+          </div>
+          <button
+            onClick={() => { setSidebarOpen(false); setSettingsOpen(true); }}
+            className="p-1.5 text-slate-400"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M2 12h2M20 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+          </button>
+        </header>
+
+        {/* Mobile panels */}
+        {mobileView === 'list' && (
+          <div className="flex-1 overflow-hidden bg-slate-50/50">
+            <NoteList
+              notes={filteredNotes} notebooks={notebooks}
+              activeNoteId={activeNoteId} search={search}
+              onSearch={setSearch} onSelect={selectNote}
+              onNew={newNote} onDelete={deleteNote}
+              onToggleStar={toggleStar}
+              filterType={filterType} filterValue={filterValue}
+            />
+          </div>
+        )}
+        {mobileView === 'editor' && (
+          <div className="flex-1 overflow-hidden">
+            <Editor note={activeNote} onUpdate={updateNote} onToggleStar={toggleStar} settings={settings} />
           </div>
         )}
 
-        <div className="hidden lg:flex w-56 flex-shrink-0 border-r border-slate-200 flex-col bg-slate-50/50">
-          <div className="px-4 py-3 border-b border-slate-200">
-            <div className="flex items-center justify-between mb-2">
-              <h2 className="text-sm font-semibold text-slate-700">{currentNb?.icon} {currentNb?.name || '笔记'}</h2>
-              <span className="text-[11px] text-slate-400">{notes.length}</span>
-            </div>
-            <button onClick={newNote}
-              className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs font-medium bg-purple-600 text-white hover:bg-purple-700 transition-colors">
-              <Plus size={13} /> 新建笔记
-            </button>
-          </div>
-          <div className="flex-1 overflow-auto py-1">
-            {filtered.map(note => (
-              <div key={note.id} onClick={() => setActiveNote(note.id)}
-                className={`group flex items-start gap-2 px-3 py-2 mx-1 rounded-md cursor-pointer transition-colors ${activeNote === note.id ? 'bg-purple-50 border border-purple-100' : 'hover:bg-slate-100 border border-transparent'}`}>
-                <FileText size={13} className="mt-0.5 flex-shrink-0 text-slate-400" />
-                <div className="flex-1 min-w-0">
-                  <p className={`text-[12px] truncate ${activeNote === note.id ? 'font-medium text-purple-700' : 'text-slate-700'}`}>{note.title || '无标题'}</p>
-                  <p className="text-[10px] text-slate-400">{new Date(note.updatedAt).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })}</p>
-                </div>
-                <button onClick={e => { e.stopPropagation(); delNote(note.id); }} className="opacity-0 group-hover:opacity-100 p-0.5 text-slate-300 hover:text-red-400"><Trash2 size={11} /></button>
-              </div>
-            ))}
-            {filtered.length === 0 && <p className="text-center text-xs text-slate-400 py-8">暂无笔记</p>}
-          </div>
-        </div>
-
-        <Editor note={activeNoteData || null} onUpdate={updateNote} onExtractTasks={extractFromNote} settings={settings} />
-
-        {taskOpen && (
-          <div className="w-64 flex-shrink-0 border-l border-slate-200 bg-white flex flex-col overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
-              <h3 className="text-sm font-semibold text-slate-700">📋 待办 ({pendingTasks.length})</h3>
-              <button onClick={() => setTaskOpen(false)} className="p-1 text-slate-400 hover:text-slate-600"><X size={14} /></button>
-            </div>
-            <div className="flex-1 overflow-auto p-2 space-y-1">
-              {pendingTasks.map(t => (
-                <div key={t.id} className="flex items-start gap-2 px-2 py-2 rounded-lg hover:bg-slate-50 group">
-                  <button onClick={() => toggleTask(t.id)} className="mt-0.5 text-slate-300 hover:text-green-500"><Circle size={14} /></button>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-[12px] text-slate-700">{t.title}</p>
-                    {t.dueDate && <p className="text-[10px] text-slate-400">📅 {t.dueDate.slice(5)}</p>}
-                  </div>
-                  <button onClick={() => delTask(t.id)} className="opacity-0 group-hover:opacity-100 text-slate-300 hover:text-red-400"><Trash2 size={11} /></button>
-                </div>
-              ))}
-              {pendingTasks.length === 0 && <p className="text-center text-xs text-slate-400 py-8">暂无待办</p>}
-              {doneTasks.length > 0 && (
-                <details className="mt-3">
-                  <summary className="text-[11px] text-slate-400 cursor-pointer px-2">已完成 ({doneTasks.length})</summary>
-                  {doneTasks.slice(0, 10).map(t => (
-                    <div key={t.id} className="flex items-center gap-2 px-2 py-1"><CheckCircle2 size={12} className="text-green-400" /><span className="text-[11px] text-slate-400 line-through truncate">{t.title}</span></div>
-                  ))}
-                </details>
-              )}
-            </div>
-          </div>
+        {/* Mobile FAB */}
+        {mobileView === 'list' && (
+          <button
+            onClick={newNote}
+            className="fixed bottom-6 right-6 w-14 h-14 rounded-full bg-violet-600 text-white shadow-lg shadow-violet-200 flex items-center justify-center hover:bg-violet-700 active:scale-95 transition-all z-40"
+          ><Plus size={24} /></button>
         )}
       </div>
 
+      {/* Mobile sidebar drawer */}
+      {sidebarOpen && (
+        <div className="fixed inset-0 z-50 lg:hidden" onClick={() => setSidebarOpen(false)}>
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
+          <div className="absolute left-0 top-0 bottom-0 w-72 bg-white shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
+              <span className="font-semibold text-slate-800">翼记</span>
+              <button onClick={() => setSidebarOpen(false)} className="p-1 text-slate-400"><X size={18} /></button>
+            </div>
+            <Sidebar
+              notebooks={notebooks} notes={allNotes}
+              filterType={filterType} filterValue={filterValue}
+              onFilter={handleFilter} onNewNotebook={newNotebook}
+              onDeleteNotebook={deleteNotebook} onOpenSettings={() => { setSidebarOpen(false); setSettingsOpen(true); }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Settings modal */}
       {settingsOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setSettingsOpen(false)}>
-          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md mx-4 p-6" onClick={e => e.stopPropagation()}>
-            <h2 className="text-lg font-semibold mb-4">设置</h2>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={() => setSettingsOpen(false)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 p-6" onClick={e => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-slate-800 mb-5">设置</h2>
             <div className="space-y-4">
-              <div className="flex gap-1 bg-slate-100 rounded-lg p-0.5">
-                {[{ k: 'rule', l: '规则引擎（离线）' }, { k: 'llm', l: 'LLM 大模型' }].map(({ k, l }) => (
-                  <button key={k} onClick={() => setSettings(s => ({ ...s, aiMode: k as 'rule' | 'llm' }))}
-                    className={`flex-1 py-2 text-xs rounded-md font-medium ${settings.aiMode === k ? 'bg-white text-purple-700 shadow-sm' : 'text-slate-500'}`}>{l}</button>
-                ))}
-              </div>
-              {settings.aiMode === 'llm' && (
-                <div className="space-y-2 p-3 bg-slate-50 rounded-lg">
-                  <input value={settings.llmEndpoint} onChange={e => setSettings(s => ({ ...s, llmEndpoint: e.target.value }))} placeholder="API 地址" className="w-full text-xs border rounded px-3 py-2" />
-                  <input value={settings.llmApiKey} onChange={e => setSettings(s => ({ ...s, llmApiKey: e.target.value }))} type="password" placeholder="API Key" className="w-full text-xs border rounded px-3 py-2" />
-                  <input value={settings.llmModel} onChange={e => setSettings(s => ({ ...s, llmModel: e.target.value }))} placeholder="模型名称" className="w-full text-xs border rounded px-3 py-2" />
+              <div>
+                <label className="text-xs font-medium text-slate-500 mb-1.5 block">界面主题</label>
+                <div className="flex gap-2">
+                  {(['light', 'dark'] as const).map(t => (
+                    <button key={t} onClick={() => setSettings(s => ({ ...s, theme: t }))}
+                      className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium transition-colors border-2
+                        ${settings.theme === t ? 'border-violet-500 bg-violet-50 text-violet-700' : 'border-slate-200 text-slate-600'}`}>
+                      {t === 'light' ? <Sun size={15} /> : <Moon size={15} />}
+                      {t === 'light' ? '浅色' : '深色'}
+                    </button>
+                  ))}
                 </div>
-              )}
-              <div className="p-3 bg-purple-50 rounded-lg">
-                <p className="text-xs font-medium text-purple-700">翼记 v3.0 · 省公司自研</p>
-                <p className="text-[11px] text-purple-500 mt-1">块编辑器 + AI任务提取 + 本地存储</p>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-slate-500 mb-1.5 block">语音识别语言</label>
+                <select
+                  value={settings.speechLang}
+                  onChange={e => setSettings(s => ({ ...s, speechLang: e.target.value }))}
+                  className="w-full text-sm border border-slate-200 rounded-xl px-3 py-2.5 outline-none focus:ring-2 focus:ring-violet-300"
+                >
+                  <option value="zh-CN">中文（普通话）</option>
+                  <option value="zh-TW">中文（繁体）</option>
+                  <option value="en-US">English (US)</option>
+                  <option value="ja-JP">日本語</option>
+                </select>
+              </div>
+              <div className="pt-2 border-t border-slate-100 text-center">
+                <p className="text-[11px] text-slate-400">翼记 v4.0 · 本地存储 · 无需登录</p>
               </div>
             </div>
             <div className="flex justify-end gap-3 mt-5">
               <button onClick={() => setSettingsOpen(false)} className="px-4 py-2 text-sm text-slate-500">取消</button>
-              <button onClick={() => { saveSettings(settings); setSettingsOpen(false); }} className="px-4 py-2 text-sm bg-purple-600 text-white rounded-lg font-medium">保存</button>
+              <button onClick={() => { saveSettings(settings); setSettingsOpen(false); }}
+                className="px-4 py-2 text-sm bg-violet-600 text-white rounded-xl font-medium hover:bg-violet-700">保存</button>
             </div>
           </div>
         </div>
@@ -210,38 +248,3 @@ function App() {
     </div>
   );
 }
-
-function MobileSidebar(props: any) {
-  const { notebooks, activeNb, onSelectNb, onNewNb, onNewNote, tasks, onToggleTask, onDeleteTask, onClose } = props;
-  return (
-    <div className="flex flex-col h-full">
-      <div className="p-4 border-b border-slate-200">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2"><span className="text-lg">⚡</span><div><h1 className="text-sm font-bold">翼记</h1><p className="text-[10px] text-slate-400">省公司自研</p></div></div>
-          <button onClick={onClose} className="p-1 text-slate-400"><X size={16} /></button>
-        </div>
-        <button onClick={onNewNote} className="w-full flex items-center justify-center gap-1.5 py-2 rounded-md text-xs font-medium bg-purple-600 text-white">新建笔记</button>
-      </div>
-      <div className="flex-1 overflow-auto">
-        <div className="px-3 py-2">
-          <div className="flex items-center justify-between px-1 mb-1"><span className="text-[10px] font-semibold uppercase text-slate-400">笔记本</span><button onClick={onNewNb} className="p-0.5 text-slate-400"><Plus size={13} /></button></div>
-          {notebooks.map((nb: Notebook) => (
-            <button key={nb.id} onClick={() => onSelectNb(nb.id)} className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs ${activeNb === nb.id ? 'bg-purple-50 text-purple-700 font-medium' : 'text-slate-600 hover:bg-slate-50'}`}>{nb.icon} {nb.name}</button>
-          ))}
-        </div>
-        <div className="px-3 py-2">
-          <span className="text-[10px] font-semibold uppercase text-slate-400 px-1">待办 ({tasks.length})</span>
-          {tasks.slice(0, 8).map((t: TaskItem) => (
-            <div key={t.id} className="flex items-center gap-1.5 px-2 py-1 rounded hover:bg-slate-50 group">
-              <button onClick={() => onToggleTask(t.id)} className="text-slate-300"><Circle size={11} /></button>
-              <span className="text-[11px] text-slate-600 truncate flex-1">{t.title}</span>
-              <button onClick={() => onDeleteTask(t.id)} className="opacity-0 group-hover:opacity-100 text-slate-300"><X size={10} /></button>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export default App;
